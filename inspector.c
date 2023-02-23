@@ -1,4 +1,4 @@
-#include <stdio.h>GYRO_SCALAR
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -6,6 +6,7 @@
 #include <ncurses.h>
 #include <hidapi/hidapi.h>
 #include "cglm/cglm.h"
+#include "../Fusion/Fusion/Fusion.h"
 
 #define AIR_VID 0x3318
 #define AIR_PID 0x0424
@@ -24,6 +25,10 @@
 static int rows, cols;
 static versor rotation = GLM_QUAT_IDENTITY_INIT;
 static vec3 ang_vel = {}, accel_vec = {};
+static FusionEuler euler;
+static FusionVector earth;
+
+#define SAMPLE_RATE (1000) // replace this with actual sample rate
 
 typedef struct {
 	uint64_t tick;
@@ -141,9 +146,11 @@ print_report()
 
 
 	mvprintw(y++, x, "Rate: %.3f %.3f %.3f", ang_vel[1], ang_vel[0], ang_vel[2]);
-	mvprintw(y++, x, "Angle: %.3f %.3f %.3f", euler_vec[2] * 180.f / 3.14159f, euler_vec[0] * 180.f / 3.14159f, euler_vec[1] * 180.f / 3.14159f);
+	// mvprintw(y++, x, "Angle: %.3f %.3f %.3f", euler_vec[2] * 180.f / 3.14159f, euler_vec[0] * 180.f / 3.14159f, euler_vec[1] * 180.f / 3.14159f);
+	mvprintw(y++, x, "Roll %0.1f, Pitch %0.1f, Yaw %0.1f",euler.angle.roll, euler.angle.pitch, euler.angle.yaw);
 	mvprintw(y++, x, "Gyro Scalar: %.9f", GYRO_SCALAR);
 	mvprintw(y++, x, "Accel: %.3f %.3f %.3f", accel_vec[0], accel_vec[1], accel_vec[2]);
+	mvprintw(y++, x, "Earth Accel: X %0.1f, Y %0.1f, Z %0.1f", earth.axis.x, earth.axis.y, earth.axis.z);
 	mvprintw(y++, x, "Accel Scalar: %.9f", ACCEL_SCALAR);
 }
 
@@ -190,6 +197,33 @@ open_device()
 int
 main(void)
 {
+	 // Define calibration (replace with actual calibration data if available)
+    const FusionMatrix gyroscopeMisalignment = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    const FusionVector gyroscopeSensitivity = {1.0f, 1.0f, 1.0f};
+    const FusionVector gyroscopeOffset = {0.0f, 0.0f, 0.0f};
+    const FusionMatrix accelerometerMisalignment = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    const FusionVector accelerometerSensitivity = {1.0f, 1.0f, 1.0f};
+    const FusionVector accelerometerOffset = {0.0f, 0.0f, 0.0f};
+    const FusionMatrix softIronMatrix = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    const FusionVector hardIronOffset = {0.0f, 0.0f, 0.0f};
+
+    // Initialise algorithms
+    FusionOffset offset;
+    FusionAhrs ahrs;
+
+    FusionOffsetInitialise(&offset, SAMPLE_RATE);
+    FusionAhrsInitialise(&ahrs);
+
+    // Set AHRS algorithm settings
+    const FusionAhrsSettings settings = {
+            .gain = 0.5f,
+            .accelerationRejection = 10.0f,
+            .magneticRejection = 20.0f,
+            .rejectionTimeout = 5 * SAMPLE_RATE, /* 5 seconds */
+    };
+    FusionAhrsSetSettings(&ahrs, &settings);
+
+
 	// open device
 	hid_device* device = open_device();
 	if (!device) {
@@ -237,15 +271,32 @@ main(void)
 		process_ang_vel(sample.ang_vel, ang_vel);
 		process_accel(sample.accel, accel_vec);
 
-		uint64_t tick_delta = 1000000;
-		if (last_sample_tick > 0)
-			tick_delta = sample.tick - last_sample_tick;
+		 // Acquire latest sensor data
+        const uint64_t timestamp = sample.tick; // replace this with actual gyroscope timestamp
+        FusionVector gyroscope = {ang_vel[0], ang_vel[1], ang_vel[2]}; // replace this with actual gyroscope data in degrees/s
+        FusionVector accelerometer = {accel_vec[0], accel_vec[1], accel_vec[2]}; // replace this with actual accelerometer data in g
+       
+        // Apply calibration
+        gyroscope = FusionCalibrationInertial(gyroscope, gyroscopeMisalignment, gyroscopeSensitivity, gyroscopeOffset);
+        accelerometer = FusionCalibrationInertial(accelerometer, accelerometerMisalignment, accelerometerSensitivity, accelerometerOffset);
+		
+		// Update gyroscope offset correction algorithm
+        gyroscope = FusionOffsetUpdate(&offset, gyroscope);
 
-		float dt = tick_delta * TICK_LEN;
-		last_sample_tick = sample.tick;
+        // Calculate delta time (in seconds) to account for gyroscope sample clock error
+        static uint64_t previousTimestamp;
+        const float deltaTime = (float) (timestamp - previousTimestamp) / (float) 1e9;
+        previousTimestamp = timestamp;
 
-		update_rotation(dt, ang_vel);
+        // Update gyroscope AHRS algorithm
+        FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, deltaTime);
 
+        // Print algorithm outputs
+        euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));
+        earth = FusionAhrsGetEarthAcceleration(&ahrs);
+
+		update_rotation(deltaTime,ang_vel);
+		
 		print_report();
 		refresh();
 	} while (res);

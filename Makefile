@@ -1,5 +1,6 @@
 CC = gcc
-LIBS = -lhidapi-libusb -lncurses
+INCS = -I../Fusion/Fusion
+LIBS = -lhidapi-libusb -lncurses -lm -lglfw -lGL -lGLEW -L../Fusion/Fusion/ -lFusion
 TARGET = inspector
 
 .PHONY: all clean
@@ -7,7 +8,7 @@ TARGET = inspector
 all: $(TARGET)
 
 $(TARGET): $(TARGET).c
-	$(CC) -o $@ $^ $(LIBS)
+	$(CC) $(INCS) -o $@ $^ $(LIBS)
 
 clean:
 	$(RM) $(TARGET)
