@@ -1,70 +1,124 @@
-#include <stdio.h>
+#include <stdio.h>GYRO_SCALAR
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <endian.h>
 #include <ncurses.h>
 #include <hidapi/hidapi.h>
+#include "cglm/cglm.h"
 
 #define AIR_VID 0x3318
 #define AIR_PID 0x0424
 
+// this is a guess
+// ticks are in nanoseconds, 1000 Hz packets
+#define TICK_LEN (1.0f / 1E9f)
+
+// based on 24bit signed int w/ FSR = +/-2000 dps, datasheet option
+#define GYRO_SCALAR (1.0f / 8388608.0f * 2000.0f)
+
+// based on 24bit signed int w/ FSR = +/-16 g, datasheet option
+#define ACCEL_SCALAR (1.0f / 8388608.0f * 16.0f)
+
+
 static int rows, cols;
+static versor rotation = GLM_QUAT_IDENTITY_INIT;
+static vec3 ang_vel = {}, accel_vec = {};
 
-static struct {
-	uint16_t unknown1; // 01 02
-	uint16_t unknown2;
-	uint8_t unknown3;
-	uint32_t some_counter1;
-	uint8_t unknown4;
-	uint64_t unknown5; // 00 00 a0 0f 00 00 00 01 
-	uint8_t unknown6;
-	int16_t rate_pitch;
-	uint8_t unknown7;
-	int16_t rate_roll;
-	uint8_t unknown8;
-	int16_t rate_yaw;
-	uint16_t unknown9; // 20 00
-	uint32_t unknown10; // 00 00 00 01
-	uint8_t unknown11;
-	int16_t rot_roll;
-	uint8_t unknown13;
-	int16_t rot_pitch1;
-	uint8_t unknown14;
-	int16_t rot_pitch2; // not sure what is going on here
-	uint16_t unknown15; // 00 80
-	uint32_t unknown16; // 00 04 00 00
-	int16_t mag1;
-	int16_t mag2;
-	int16_t mag3;
-	uint32_t some_counter2;
-	uint32_t unknown17; // 00 00 00 00
-	uint8_t unknown18;
-	uint8_t unknown19;
-} __attribute__((__packed__)) report;
+typedef struct {
+	uint64_t tick;
+	int32_t ang_vel[3];
+	int32_t accel[3];
+} air_sample;
 
-// guessing that those values are mag and rotation,
-// but confident about angular rate
+static int
+parse_report(const unsigned char* buffer, int size, air_sample* out_sample)
+{
+	if (size != 64) {
+		printf("Invalid packet size");
+		return -1;
+	}
+	// clock in nanoseconds
+	buffer += 4;
+	out_sample->tick = ((uint64_t)*(buffer++)) | (((uint64_t)*(buffer++))  << 8) | (((uint64_t)*(buffer++)) << 16) | (((uint64_t)*(buffer++)) << 24) 
+						| (((uint64_t)*(buffer++)) << 32) | (((uint64_t)*(buffer++))  << 40) | (((uint64_t)*(buffer++))  << 48) | (((uint64_t)*(buffer++))  << 56);
+	
+	// gyroscope measurements
+	buffer += 6;
+	if( *(buffer+2) & 0x80 ) {
+		out_sample->ang_vel[0] = (0xff << 24) | *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	} else {
+		out_sample->ang_vel[0] = *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	}
+	
+	if( *(buffer+2) & 0x80 ) {
+		out_sample->ang_vel[1] = (0xff << 24) | *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	} else {
+		out_sample->ang_vel[1] = *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	}
+
+	if( *(buffer+2) & 0x80 ) {
+		out_sample->ang_vel[2] = (0xff << 24) | *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	} else {
+		out_sample->ang_vel[2] = *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	}
+
+	// accelerometer data
+	buffer += 6;
+	if( *(buffer+2) & 0x80 ) {
+		out_sample->accel[0] = (0xff << 24) | *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	} else {
+		out_sample->accel[0] = *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	}
+	
+	if( *(buffer+2) & 0x80 ) {
+		out_sample->accel[1] = (0xff << 24) | *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	} else {
+		out_sample->accel[1] = *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	}
+
+	if( *(buffer+2) & 0x80 ) {
+		out_sample->accel[2] = (0xff << 24) | *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	} else {
+		out_sample->accel[2] = *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
+	}
+
+	return 0;
+}
 
 static void
-fix_report()
+process_ang_vel(const int32_t in_ang_vel[3], vec3 out_vec)
 {
-	report.unknown1 = le32toh(report.unknown1);
-	report.some_counter1 = le32toh(report.some_counter1);
+	// these scale and bias corrections are all rough guesses
+	out_vec[0] = (float)(in_ang_vel[0]) * -1.0f * GYRO_SCALAR;
+	out_vec[1] = (float)(in_ang_vel[2]) * GYRO_SCALAR;
+	out_vec[2] = (float)(in_ang_vel[1]) * GYRO_SCALAR;
+}
 
-	report.rate_pitch = le16toh(report.rate_pitch);
-	report.rate_roll = le16toh(report.rate_roll);
-	report.rate_yaw = le16toh(report.rate_yaw);
+static void
+process_accel(const int32_t in_accel[3], vec3 out_vec)
+{
+	// these scale and bias corrections are all rough guesses
+	out_vec[0] = (float)(in_accel[0]) * ACCEL_SCALAR;
+	out_vec[1] = (float)(in_accel[2]) * ACCEL_SCALAR;
+	out_vec[2] = (float)(in_accel[1]) * ACCEL_SCALAR;
+}
 
-	report.rot_roll = le16toh(report.rot_roll);
-	report.rot_pitch1 = le16toh(report.rot_pitch1);
-	report.rot_pitch2 = le16toh(report.rot_pitch2);
+static void
+update_rotation(float dt, vec3 in_ang_vel)
+{
+	float ang_vel_length = glm_vec3_norm(in_ang_vel);
 
-	report.mag1 = le16toh(report.mag1);
-	report.mag2 = le16toh(report.mag2);
-	report.mag3 = le16toh(report.mag3);
+	if (ang_vel_length > 0.0001f) {
+		vec3 rot_axis = { in_ang_vel[0] / ang_vel_length, in_ang_vel[1] / ang_vel_length, in_ang_vel[2] / ang_vel_length };
+		float rot_angle = ang_vel_length * dt;
 
-	report.some_counter2 = le32toh(report.some_counter2);
+		versor delta_rotation;
+		glm_quatv(delta_rotation, rot_angle, rot_axis);
+		glm_quat_mul(rotation, delta_rotation, rotation);
+	}
+
+	glm_quat_normalize(rotation);
 }
 
 static void
@@ -75,9 +129,22 @@ print_report()
 	int x = (cols - WIDTH) / 2;
 	int y = (rows - HEIGHT) / 2;
 
-	mvprintw(y++, x, "Rate: %04hx %04hx %04hx", report.rate_roll, report.rate_pitch, report.rate_yaw);
-	mvprintw(y++, x, "Rot:  %04hx %04hx %04hx", report.rot_roll, report.rot_pitch1, report.rot_pitch2);
-	mvprintw(y++, x, "Mag:  %04hx %04hx %04hx", report.mag1, report.mag2, report.mag3);
+	 // Convert versor to rotation matrix
+	mat4 rotation_mat;
+	glm_mat4_identity(rotation_mat);
+	glm_quat_mat4(rotation, rotation_mat);
+
+	vec3 euler_vec;
+	glm_euler_angles(rotation_mat, euler_vec);
+
+	// glm_vec3_scale(euler_vec,(180.f / 3.14159f), euler_vec);
+
+
+	mvprintw(y++, x, "Rate: %.3f %.3f %.3f", ang_vel[1], ang_vel[0], ang_vel[2]);
+	mvprintw(y++, x, "Angle: %.3f %.3f %.3f", euler_vec[2] * 180.f / 3.14159f, euler_vec[0] * 180.f / 3.14159f, euler_vec[1] * 180.f / 3.14159f);
+	mvprintw(y++, x, "Gyro Scalar: %.9f", GYRO_SCALAR);
+	mvprintw(y++, x, "Accel: %.3f %.3f %.3f", accel_vec[0], accel_vec[1], accel_vec[2]);
+	mvprintw(y++, x, "Accel Scalar: %.9f", ACCEL_SCALAR);
 }
 
 static void
@@ -138,27 +205,46 @@ main(void)
 		return 1;
 	}
 
+	glm_quat_copy(GLM_QUAT_IDENTITY, rotation);
+
 	initscr();
 	cbreak();
 	noecho();
 	curs_set(0);
+
+	unsigned char buffer[64] = {};
+	uint64_t last_sample_tick = 0;
+	air_sample sample = {};
+
 	do {
 		getmaxyx(stdscr, rows, cols);
 		erase();
 
-		res = hid_read(device, (void*)&report, sizeof(report));
+		res = hid_read(device, (void*)&buffer, sizeof(buffer));
 		if (res < 0) {
-			print_line("Unable to get feature report");
-			refresh();
+			printf("Unable to get feature report\n");
 			break;
-		} else fix_report();
+		}
 
-		if (report.unknown1 != 0x0201) {
-			print_bytes((void*)&report, res);
+		if (buffer[0] != 0x01 || buffer[1] != 0x02){
+			print_bytes((void*)&buffer, res);
 			refresh();
 			//getch();
 			continue;
 		}
+
+		parse_report(buffer, sizeof(buffer), &sample);
+		process_ang_vel(sample.ang_vel, ang_vel);
+		process_accel(sample.accel, accel_vec);
+
+		uint64_t tick_delta = 1000000;
+		if (last_sample_tick > 0)
+			tick_delta = sample.tick - last_sample_tick;
+
+		float dt = tick_delta * TICK_LEN;
+		last_sample_tick = sample.tick;
+
+		update_rotation(dt, ang_vel);
 
 		print_report();
 		refresh();
