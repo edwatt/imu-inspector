@@ -3,10 +3,19 @@
 #include <stdint.h>
 #include <string.h>
 #include <endian.h>
+#include <math.h>
+#include <time.h>
 #include <ncurses.h>
 #include <hidapi/hidapi.h>
 #include "cglm/cglm.h"
 #include "../Fusion/Fusion/Fusion.h"
+#include <signal.h>
+
+static volatile int keepRunning = 1;
+
+void intHandler(int dummy) {
+    keepRunning = 0;
+}
 
 #define AIR_VID 0x3318
 #define AIR_PID 0x0424
@@ -21,12 +30,20 @@
 // based on 24bit signed int w/ FSR = +/-16 g, datasheet option
 #define ACCEL_SCALAR (1.0f / 8388608.0f * 16.0f)
 
+#define MAG_SCALAR (1.0f / 32768.0f) * 1600.0f
+#define MAG_OFFSET -1600.0f
+
 
 static int rows, cols;
 static versor rotation = GLM_QUAT_IDENTITY_INIT;
-static vec3 ang_vel = {}, accel_vec = {};
+static vec3 ang_vel = {}, accel_vec = {}, mag_vec = {};
+static vec3 mag_max_vec = {}, mag_min_vec = {}, mag_w_offset_vec = {};
+static FusionQuaternion quaternion;
 static FusionEuler euler;
 static FusionVector earth;
+static bool stats_init = true;
+static FILE *fpt;
+
 
 #define SAMPLE_RATE (1000) // replace this with actual sample rate
 
@@ -34,6 +51,7 @@ typedef struct {
 	uint64_t tick;
 	int32_t ang_vel[3];
 	int32_t accel[3];
+	uint16_t mag[3];
 } air_sample;
 
 static int
@@ -88,6 +106,13 @@ parse_report(const unsigned char* buffer, int size, air_sample* out_sample)
 		out_sample->accel[2] = *(buffer++) | (*(buffer++) << 8) | (*(buffer++) << 16);
 	}
 
+	// mag data
+	buffer += 6;
+	
+	out_sample->mag[0] = *(buffer++) | (*(buffer++) << 8);
+	out_sample->mag[1] = *(buffer++) | (*(buffer++) << 8);
+	out_sample->mag[2] = *(buffer++) | (*(buffer++) << 8);
+	
 	return 0;
 }
 
@@ -107,6 +132,45 @@ process_accel(const int32_t in_accel[3], vec3 out_vec)
 	out_vec[0] = (float)(in_accel[0]) * ACCEL_SCALAR;
 	out_vec[1] = (float)(in_accel[2]) * ACCEL_SCALAR;
 	out_vec[2] = (float)(in_accel[1]) * ACCEL_SCALAR;
+}
+
+static void
+process_mag(const uint16_t in_mag[3], vec3 out_vec)
+{
+	// these scale and bias corrections are all rough guesses
+	out_vec[0] = (float)(in_mag[0]) * MAG_SCALAR + MAG_OFFSET;
+	out_vec[1] = (float)(in_mag[2]) * MAG_SCALAR + MAG_OFFSET;
+	out_vec[2] = (float)(in_mag[1]) * MAG_SCALAR + MAG_OFFSET;
+}
+
+static void
+process_mag_stats()
+{
+	if(stats_init)
+	{
+		glm_vec3_copy(mag_vec, mag_max_vec);
+		glm_vec3_copy(mag_vec, mag_min_vec);
+		stats_init = false;		
+
+	}else {
+		int n = 0;
+		mag_max_vec[n] = fmax(mag_max_vec[n],mag_vec[n]);
+		mag_min_vec[n] = fmin(mag_min_vec[n],mag_vec[n]);
+		n=1;
+		mag_max_vec[n] = fmax(mag_max_vec[n],mag_vec[n]);
+		mag_min_vec[n] = fmin(mag_min_vec[n],mag_vec[n]);
+		n=2;
+		mag_max_vec[n] = fmax(mag_max_vec[n],mag_vec[n]);
+		mag_min_vec[n] = fmin(mag_min_vec[n],mag_vec[n]);
+	}
+
+	int n = 0;
+	mag_w_offset_vec[n] = (mag_vec[n] - ((mag_max_vec[n] + mag_min_vec[n]) / 2.0f));
+	n = 1;
+	mag_w_offset_vec[n] = (mag_vec[n] - ((mag_max_vec[n] + mag_min_vec[n]) / 2.0f));
+	n = 2;
+	mag_w_offset_vec[n] = (mag_vec[n] - ((mag_max_vec[n] + mag_min_vec[n]) / 2.0f));
+	
 }
 
 static void
@@ -144,6 +208,17 @@ print_report()
 
 	// glm_vec3_scale(euler_vec,(180.f / 3.14159f), euler_vec);
 
+	float mag_magnitude = sqrt( mag_vec[0]*mag_vec[0] + mag_vec[1]*mag_vec[1] + mag_vec[2] * mag_vec[2]);
+	float heading = atan2(mag_vec[0], mag_vec[1]) * 180.0f / M_PI;
+
+	float offset_magnitude = sqrt( mag_w_offset_vec[0]*mag_w_offset_vec[0] + mag_w_offset_vec[1]*mag_w_offset_vec[1] + mag_w_offset_vec[2] * mag_w_offset_vec[2]);
+	float offset_heading = atan2(mag_w_offset_vec[0], mag_w_offset_vec[1]) * 180.0f / M_PI;
+	float heading1 = atan2(mag_w_offset_vec[1], mag_w_offset_vec[0]) * 180.0f / M_PI;
+	float heading2 = atan2(mag_w_offset_vec[0], mag_w_offset_vec[2]) * 180.0f / M_PI;
+	float heading3 = atan2(mag_w_offset_vec[2], mag_w_offset_vec[0]) * 180.0f / M_PI;
+	float heading4 = atan2(mag_w_offset_vec[1], mag_w_offset_vec[2]) * 180.0f / M_PI;
+	float heading5 = atan2(mag_w_offset_vec[2], mag_w_offset_vec[1]) * 180.0f / M_PI;
+
 
 	mvprintw(y++, x, "Rate: %.3f %.3f %.3f", ang_vel[1], ang_vel[0], ang_vel[2]);
 	// mvprintw(y++, x, "Angle: %.3f %.3f %.3f", euler_vec[2] * 180.f / 3.14159f, euler_vec[0] * 180.f / 3.14159f, euler_vec[1] * 180.f / 3.14159f);
@@ -152,6 +227,12 @@ print_report()
 	mvprintw(y++, x, "Accel: %.3f %.3f %.3f", accel_vec[0], accel_vec[1], accel_vec[2]);
 	mvprintw(y++, x, "Earth Accel: X %0.1f, Y %0.1f, Z %0.1f", earth.axis.x, earth.axis.y, earth.axis.z);
 	mvprintw(y++, x, "Accel Scalar: %.9f", ACCEL_SCALAR);
+	mvprintw(y++, x, "Mag: %.6f %.6f %.6f %.6f, %.6f", mag_vec[0], mag_vec[1], mag_vec[2], mag_magnitude, heading);
+	mvprintw(y++, x, "Mag Max: %.6f %.6f %.6f", mag_max_vec[0], mag_max_vec[1], mag_max_vec[2]);
+	mvprintw(y++, x, "Mag Min: %.6f %.6f %.6f", mag_min_vec[0], mag_min_vec[1], mag_min_vec[2]);
+	mvprintw(y++, x, "Mag Offset: %.6f %.6f %.6f", ((mag_max_vec[0] + mag_min_vec[0]) / 2.0f), ((mag_max_vec[1] + mag_min_vec[1]) / 2.0f), ((mag_max_vec[2] + mag_min_vec[2]) / 2.0f));
+	mvprintw(y++, x, "Mag w/ Offset: %.6f %.6f %.6f %.6f %.6f", mag_w_offset_vec[0], mag_w_offset_vec[1], mag_w_offset_vec[2], offset_magnitude, offset_heading);
+	mvprintw(y++, x, "Offset headings: %.6f %.6f %.6f %.6f %.6f %.6f", offset_heading, heading1, heading2, heading3, heading4, heading5);
 }
 
 static void
@@ -197,6 +278,29 @@ open_device()
 int
 main(void)
 {
+
+	signal(SIGINT, intHandler);
+
+	// open log file
+	char filename[40];
+	struct tm *timenow;
+
+	time_t now = time(NULL);
+	timenow = gmtime(&now);
+
+	strftime(filename, sizeof(filename), "./logs/data_%Y-%m-%d_%H-%M-%S.csv", timenow);
+
+	fpt = fopen(filename, "w+");
+
+	if(fpt == NULL) {
+		// get out code
+		printf("File open failed. Exiting...");
+		exit(1);
+	}	
+
+	fprintf(fpt,"ts_nanoseconds, gyro1_dps, gyro2_dps, gyro3_dps, accel1_g, accel2_g, accel3_g, mag1_uT, mag2_uT, mag3_uT, euler1_deg, euler2_deg, euler3_deg, quat1, quat2, quat3, quat4, accel_err_deg, accel_ignored, accel_rej_timer,mag_err_deg,mag_ignored,mag_rej_timer, initialising, accel_rej_warn, accel_rej_timeout, mag_rej_warn, mag_rej_timeout,\n");
+	
+	
 	 // Define calibration (replace with actual calibration data if available)
     const FusionMatrix gyroscopeMisalignment = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
     const FusionVector gyroscopeSensitivity = {1.0f, 1.0f, 1.0f};
@@ -250,6 +354,8 @@ main(void)
 	uint64_t last_sample_tick = 0;
 	air_sample sample = {};
 
+	uint16_t read_count = 0;
+
 	do {
 		getmaxyx(stdscr, rows, cols);
 		erase();
@@ -270,7 +376,11 @@ main(void)
 		parse_report(buffer, sizeof(buffer), &sample);
 		process_ang_vel(sample.ang_vel, ang_vel);
 		process_accel(sample.accel, accel_vec);
+		process_mag(sample.mag, mag_vec);	
+		process_mag_stats();
+		
 
+			
 		 // Acquire latest sensor data
         const uint64_t timestamp = sample.tick; // replace this with actual gyroscope timestamp
         FusionVector gyroscope = {ang_vel[0], ang_vel[1], ang_vel[2]}; // replace this with actual gyroscope data in degrees/s
@@ -292,19 +402,45 @@ main(void)
         FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, deltaTime);
 
         // Print algorithm outputs
-        euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));
+		quaternion = FusionAhrsGetQuaternion(&ahrs);
+        euler = FusionQuaternionToEuler(quaternion);
         earth = FusionAhrsGetEarthAcceleration(&ahrs);
+
+		FusionAhrsInternalStates internal_states = FusionAhrsGetInternalStates(&ahrs);
+		FusionAhrsFlags ahrs_flags = FusionAhrsGetFlags(&ahrs);
 
 		update_rotation(deltaTime,ang_vel);
 		
-		print_report();
-		refresh();
-	} while (res);
+		fprintf(fpt,"%lu, %f, %f, %f, %f, %f, %f, %f, %f, %f,",timestamp, ang_vel[0],ang_vel[1],ang_vel[2],accel_vec[0], accel_vec[1], accel_vec[2], mag_vec[0], mag_vec[1], mag_vec[2]);
+		fprintf(fpt," %f, %f, %f, %f, %f, %f, %f,", euler.angle.roll, euler.angle.pitch, euler.angle.yaw, quaternion.element.w, quaternion.element.x,quaternion.element.y,quaternion.element.z);
+		fprintf(fpt," %f, %d, %f, %f, %d, %f,",internal_states.accelerationError, internal_states.accelerometerIgnored, internal_states.accelerationRejectionTimer,
+																											internal_states.magneticError, internal_states.magnetometerIgnored, internal_states.magneticRejectionTimer);
+		fprintf(fpt," %d, %d, %d, %d, %d,\n", ahrs_flags.initialising, ahrs_flags.accelerationRejectionWarning, ahrs_flags.accelerationRejectionTimeout, 
+																										 ahrs_flags.magneticRejectionWarning, ahrs_flags.magneticRejectionTimeout);
+		
+		read_count++;
+
+		if(read_count % 500 == 0)
+		{
+			print_report();
+			refresh();					
+		}
+
+		// if(read_count % 30000 == 0)
+		// {
+		// 	stats_init = true;
+		// }
+
+		
+	} while (res && keepRunning);
 	getch();
 	endwin();
 
 	hid_close(device);
 	res = hid_exit();
 
+	fclose(fpt);
+
+	printf("Exiting...");
 	return 0;
 }
