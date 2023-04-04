@@ -43,6 +43,7 @@ static FusionEuler euler;
 static FusionVector earth;
 static bool stats_init = true;
 static FILE *fpt;
+static struct timespec start_clock, now_clock;
 
 
 #define SAMPLE_RATE (1000) // replace this with actual sample rate
@@ -219,7 +220,10 @@ print_report()
 	float heading4 = atan2(mag_w_offset_vec[1], mag_w_offset_vec[2]) * 180.0f / M_PI;
 	float heading5 = atan2(mag_w_offset_vec[2], mag_w_offset_vec[1]) * 180.0f / M_PI;
 
+	clock_gettime(CLOCK_REALTIME, &now_clock);
+	time_t seconds_elapsed = now_clock.tv_sec - start_clock.tv_sec;    // in seconds
 
+	mvprintw(y++, x, "Time Elapsed (s): %jd", seconds_elapsed);
 	mvprintw(y++, x, "Rate: %.3f %.3f %.3f", ang_vel[1], ang_vel[0], ang_vel[2]);
 	// mvprintw(y++, x, "Angle: %.3f %.3f %.3f", euler_vec[2] * 180.f / 3.14159f, euler_vec[0] * 180.f / 3.14159f, euler_vec[1] * 180.f / 3.14159f);
 	mvprintw(y++, x, "Roll %0.1f, Pitch %0.1f, Yaw %0.1f",euler.angle.roll, euler.angle.pitch, euler.angle.yaw);
@@ -297,6 +301,7 @@ main(void)
 		printf("File open failed. Exiting...");
 		exit(1);
 	}	
+	
 
 	fprintf(fpt,"ts_nanoseconds, gyro1_dps, gyro2_dps, gyro3_dps, accel1_g, accel2_g, accel3_g, mag1_uT, mag2_uT, mag3_uT, euler1_deg, euler2_deg, euler3_deg, quat1, quat2, quat3, quat4, accel_err_deg, accel_ignored, accel_rej_timer,mag_err_deg,mag_ignored,mag_rej_timer, initialising, accel_rej_warn, accel_rej_timeout, mag_rej_warn, mag_rej_timeout,\n");
 	
@@ -326,6 +331,16 @@ main(void)
             .rejectionTimeout = 5 * SAMPLE_RATE, /* 5 seconds */
     };
     FusionAhrsSetSettings(&ahrs, &settings);
+	
+	FusionAhrsInternalStates internal_states = FusionAhrsGetInternalStates(&ahrs);
+	FusionAhrsFlags ahrs_flags = FusionAhrsGetFlags(&ahrs);
+
+	fprintf(fpt," %f, %d, %f, %f, %d, %f,",internal_states.accelerationError, internal_states.accelerometerIgnored, internal_states.accelerationRejectionTimer,
+																											internal_states.magneticError, internal_states.magnetometerIgnored, internal_states.magneticRejectionTimer);
+	fprintf(fpt," %d, %d, %d, %d, %d\n", ahrs_flags.initialising, ahrs_flags.accelerationRejectionWarning, ahrs_flags.accelerationRejectionTimeout, 
+																										 ahrs_flags.magneticRejectionWarning, ahrs_flags.magneticRejectionTimeout);
+
+
 
 
 	// open device
@@ -356,6 +371,9 @@ main(void)
 
 	uint16_t read_count = 0;
 
+	clock_gettime(CLOCK_REALTIME, &start_clock);
+
+	
 	do {
 		getmaxyx(stdscr, rows, cols);
 		erase();
@@ -382,9 +400,9 @@ main(void)
 
 			
 		 // Acquire latest sensor data
-        const uint64_t timestamp = sample.tick; // replace this with actual gyroscope timestamp
-        FusionVector gyroscope = {ang_vel[0], ang_vel[1], ang_vel[2]}; // replace this with actual gyroscope data in degrees/s
-        FusionVector accelerometer = {accel_vec[0], accel_vec[1], accel_vec[2]}; // replace this with actual accelerometer data in g
+        const uint64_t timestamp = sample.tick;
+        FusionVector gyroscope = {ang_vel[0], ang_vel[1], ang_vel[2]};
+        FusionVector accelerometer = {accel_vec[0], accel_vec[1], accel_vec[2]}; 
        
         // Apply calibration
         gyroscope = FusionCalibrationInertial(gyroscope, gyroscopeMisalignment, gyroscopeSensitivity, gyroscopeOffset);
@@ -398,6 +416,11 @@ main(void)
         const float deltaTime = (float) (timestamp - previousTimestamp) / (float) 1e9;
         previousTimestamp = timestamp;
 
+		if(deltaTime > 0.01){
+			FusionAhrsReset(&ahrs);
+			continue;
+		}
+
         // Update gyroscope AHRS algorithm
         FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, deltaTime);
 
@@ -406,8 +429,10 @@ main(void)
         euler = FusionQuaternionToEuler(quaternion);
         earth = FusionAhrsGetEarthAcceleration(&ahrs);
 
-		FusionAhrsInternalStates internal_states = FusionAhrsGetInternalStates(&ahrs);
-		FusionAhrsFlags ahrs_flags = FusionAhrsGetFlags(&ahrs);
+		// FusionAhrsInternalStates 
+		internal_states = FusionAhrsGetInternalStates(&ahrs);
+		// FusionAhrsFlags 
+		ahrs_flags = FusionAhrsGetFlags(&ahrs);
 
 		update_rotation(deltaTime,ang_vel);
 		
@@ -415,7 +440,7 @@ main(void)
 		fprintf(fpt," %f, %f, %f, %f, %f, %f, %f,", euler.angle.roll, euler.angle.pitch, euler.angle.yaw, quaternion.element.w, quaternion.element.x,quaternion.element.y,quaternion.element.z);
 		fprintf(fpt," %f, %d, %f, %f, %d, %f,",internal_states.accelerationError, internal_states.accelerometerIgnored, internal_states.accelerationRejectionTimer,
 																											internal_states.magneticError, internal_states.magnetometerIgnored, internal_states.magneticRejectionTimer);
-		fprintf(fpt," %d, %d, %d, %d, %d,\n", ahrs_flags.initialising, ahrs_flags.accelerationRejectionWarning, ahrs_flags.accelerationRejectionTimeout, 
+		fprintf(fpt," %d, %d, %d, %d, %d\n", ahrs_flags.initialising, ahrs_flags.accelerationRejectionWarning, ahrs_flags.accelerationRejectionTimeout, 
 																										 ahrs_flags.magneticRejectionWarning, ahrs_flags.magneticRejectionTimeout);
 		
 		read_count++;
@@ -441,6 +466,8 @@ main(void)
 
 	fclose(fpt);
 
-	printf("Exiting...");
+	printf("Logfile: %s\n", filename);
+
+	printf("Exiting...\n");
 	return 0;
 }
