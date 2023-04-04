@@ -331,6 +331,16 @@ main(void)
             .rejectionTimeout = 5 * SAMPLE_RATE, /* 5 seconds */
     };
     FusionAhrsSetSettings(&ahrs, &settings);
+	
+	FusionAhrsInternalStates internal_states = FusionAhrsGetInternalStates(&ahrs);
+	FusionAhrsFlags ahrs_flags = FusionAhrsGetFlags(&ahrs);
+
+	fprintf(fpt," %f, %d, %f, %f, %d, %f,",internal_states.accelerationError, internal_states.accelerometerIgnored, internal_states.accelerationRejectionTimer,
+																											internal_states.magneticError, internal_states.magnetometerIgnored, internal_states.magneticRejectionTimer);
+	fprintf(fpt," %d, %d, %d, %d, %d\n", ahrs_flags.initialising, ahrs_flags.accelerationRejectionWarning, ahrs_flags.accelerationRejectionTimeout, 
+																										 ahrs_flags.magneticRejectionWarning, ahrs_flags.magneticRejectionTimeout);
+
+
 
 
 	// open device
@@ -419,8 +429,10 @@ main(void)
         euler = FusionQuaternionToEuler(quaternion);
         earth = FusionAhrsGetEarthAcceleration(&ahrs);
 
-		FusionAhrsInternalStates internal_states = FusionAhrsGetInternalStates(&ahrs);
-		FusionAhrsFlags ahrs_flags = FusionAhrsGetFlags(&ahrs);
+		// FusionAhrsInternalStates 
+		internal_states = FusionAhrsGetInternalStates(&ahrs);
+		// FusionAhrsFlags 
+		ahrs_flags = FusionAhrsGetFlags(&ahrs);
 
 		update_rotation(deltaTime,ang_vel);
 		
